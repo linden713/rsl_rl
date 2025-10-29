@@ -258,3 +258,37 @@ class RolloutStorage:
                 ), masks_batch
 
                 first_traj = last_traj
+
+
+
+    def transformerxl_batch_generator(self):
+        if self.training_type != "rl":
+            raise ValueError("This function is only available for reinforcement learning training.")
+        if self.num_envs == 0:
+            return
+
+        # We keep the rollout structure intact (one sequence per environment) and rely on the dones buffer
+        # to expose episode boundaries. This yields data shaped like:
+        #   [[a1, a2, a3, a4 | a5, a6],
+        #    [b1, b2 | b3, b4, b5 | b6]]
+        obs_batch = self.observations
+        actions_batch = self.actions
+        old_mu_batch = self.mu
+        old_sigma_batch = self.sigma
+        returns_batch = self.returns
+        advantages_batch = self.advantages
+        values_batch = self.values
+        old_actions_log_prob_batch = self.actions_log_prob
+
+        yield (
+            obs_batch,
+            actions_batch,
+            values_batch,
+            advantages_batch,
+            returns_batch,
+            old_actions_log_prob_batch,
+            old_mu_batch,
+            old_sigma_batch,
+            (None, None),
+            None,
+        )

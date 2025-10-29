@@ -14,6 +14,8 @@ from rsl_rl.networks import MLP, EmpiricalNormalization
 
 class ActorCritic(nn.Module):
     is_recurrent = False
+    is_transformerxl = False
+
 
     def __init__(
         self,
