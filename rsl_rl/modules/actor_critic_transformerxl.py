@@ -12,7 +12,7 @@ from torch.distributions import Normal
 from rsl_rl.networks import EmpiricalNormalization, MLP, TransformerXL
 from rsl_rl.utils import unpad_trajectories
 
-
+_default = object()
 class ActorCriticTransformerXL(nn.Module):
     is_recurrent = False 
     is_transformerxl = True
@@ -36,8 +36,12 @@ class ActorCriticTransformerXL(nn.Module):
         transformer_ff_multiplier: float = 4.0,
         transformer_dropout: float = 0.0,
         memory_length: int = 128,
+        transformer_pos_bias_max: float = 2.0,
+        transformer_norm_type: str = "rms",
         **kwargs,
     ):
+        # print(memory_length)
+        # print("-"*60)
         if kwargs:
             print(
                 "ActorCriticTransformerXL.__init__ got unexpected arguments, which will be ignored: "
@@ -59,8 +63,14 @@ class ActorCriticTransformerXL(nn.Module):
             num_critic_obs += obs[obs_group].shape[-1]
 
         # transformer backbones (separate caches for actor and critic)
-        self.obs_project_actor = nn.Linear(num_actor_obs, transformer_model_dim)
-        self.obs_project_critic = nn.Linear(num_critic_obs, transformer_model_dim)
+        # Project raw observations to transformer model dimension using a
+        # single hidden layer (2x model dim).
+        self.obs_project_actor = MLP(
+            num_actor_obs, transformer_model_dim, [transformer_model_dim * 2], activation
+        )
+        self.obs_project_critic = MLP(
+            num_critic_obs, transformer_model_dim, [transformer_model_dim * 2], activation
+        )
 
         self.transformerxl = TransformerXL(
             transformer_model_dim,
@@ -70,6 +80,8 @@ class ActorCriticTransformerXL(nn.Module):
             ff_multiplier=transformer_ff_multiplier,
             dropout=transformer_dropout,
             memory_length=memory_length,
+            pos_bias_max=transformer_pos_bias_max,
+            norm_type=transformer_norm_type,
         )
 
 
@@ -127,6 +139,10 @@ class ActorCriticTransformerXL(nn.Module):
         self._actor_inference_state = None
         self._critic_state = None
 
+        self.hidden_actor_state = None
+        self.hidden_critic_state = None
+
+
     @property
     def action_mean(self):
         return self.distribution.mean
@@ -140,66 +156,70 @@ class ActorCriticTransformerXL(nn.Module):
         return self.distribution.entropy().sum(dim=-1)
 
     def reset(self, dones=None, hidden_states=None):
-        if dones is None:
-            self._actor_state = None
-            self._actor_inference_state = None
-            self._critic_state = None
-            return
 
         dones_bool = dones.to(dtype=torch.bool)
 
         self._actor_state = self._mask_done_entries(self._actor_state, dones_bool)
         self._actor_inference_state = self._mask_done_entries(self._actor_inference_state, dones_bool)
         self._critic_state = self._mask_done_entries(self._critic_state, dones_bool)
+        self.hidden_actor_state = self._mask_done_entries(self.hidden_actor_state, dones_bool)
+        self.hidden_critic_state = self._mask_done_entries(self.hidden_critic_state, dones_bool)
 
 
     def forward(self):
         raise NotImplementedError
     
     def _mask_done_entries(self, state, dones):
-        if not state or dones is None:
+        if state is None or dones is None:
             return state
 
-        cache, abs_pos = state
+        cache = state
         if dones.dim() > 1:
             dones = dones.flatten()
 
         keep_mask = (~dones).view(-1, 1, 1, 1)
 
-        masked_cache = [
-            None if layer is None else (k * keep_mask, v * keep_mask)
-            for layer in cache
-            for k, v in [layer]  # unpack safely inside comprehension
-        ]
+        masked_cache = []
+        for layer in cache:
+            if layer is None:
+                masked_cache.append(None)
+            else:
+                k, v = layer
+                masked_k = k * keep_mask if k is not None else None
+                masked_v = v * keep_mask if v is not None else None
+                masked_cache.append((masked_k, masked_v))
+        return masked_cache
 
-        return masked_cache, abs_pos
 
+    def _apply_transformer(self, obs, state):
+        """Run the Transformer-XL backbone while keeping tensor layouts explicit.
 
-    def _apply_transformer(self, obs, state_attr):
-        is_streaming = obs.dim() < 3
-        state = getattr(self, state_attr) 
+        - Streaming mode (collecting data): obs is [num_envs, feature_dim].
+        - Training mode: obs is [time, num_envs, feature_dim].
 
-        # Adapt input to the format TransformerXL's layers expect ([batch, seq, dim]),
-        # bypassing the flawed shape handling inside TransformerXL.forward.
-        if is_streaming:
-            # Manually convert [batch, dim] to [batch, 1, dim].
-            obs = obs.unsqueeze(1)
+        Transformer-XL expects [batch, seq, dim], i.e. [num_envs, time, dim].
+        """
+        if obs.dim() == 2:
+            # [B, D] -> [B, 1, D] so TXL treats the step as a length-1 sequence.
+            transformer_input = obs.unsqueeze(1)
+            squeeze_output = True
+        elif obs.dim() == 3:
+            # [T, B, D] -> [B, T, D] so attention runs along the time axis.
+            transformer_input = obs.permute(1, 0, 2).contiguous()
+            squeeze_output = False
         else:
-            # Manually convert [seq, batch, dim] to [batch, seq, dim].
-            obs = obs.permute(1, 0, 2)
-        print(state_attr)
-        print(obs.shape)
-        features, new_state = self.transformerxl(obs, state=state)
+            raise ValueError(f"Unsupported observation rank {obs.dim()}; expected 2 or 3.")
 
-        # Adapt output back to original format
-        if is_streaming:
+        features, new_state = self.transformerxl(transformer_input, state=state)
+        # print(transformer_input.shape)
+        if squeeze_output:
+            # [B, 1, D] -> [B, D]
             features = features.squeeze(1)
         else:
-            features = features.permute(1, 0, 2)
-
-        if new_state is not None:
-            setattr(self, state_attr, new_state)
-        return features
+            # [B, T, D] -> [T, B, D] to match the caller's expected layout.
+            features = features.permute(1, 0, 2).contiguous()
+        # self.print_state(state=new_state)
+        return features, new_state
 
     def _update_distribution(self, features):
         if self.state_dependent_std:
@@ -225,14 +245,19 @@ class ActorCriticTransformerXL(nn.Module):
                 )
         self.distribution = Normal(mean, std)
 
-    def act(self, obs, masks=None, hidden_states=None):
+    def act(self, obs, masks=None, hidden_states=_default):
         obs = self.get_actor_obs(obs)
         obs = self.actor_obs_normalizer(obs)
         obs = self.obs_project_actor(obs)
-        features = self._apply_transformer(
+        features,state = self._apply_transformer(
             obs,
-            "_actor_state",
+            self._actor_state if hidden_states is _default else self.hidden_actor_state ,
         )
+        if hidden_states is _default:
+            self._actor_state = state
+        else:
+            self.hidden_actor_state = state
+
         # if masks is not None:
         #     features = unpad_trajectories(features, masks)
         self._update_distribution(features)
@@ -242,9 +267,9 @@ class ActorCriticTransformerXL(nn.Module):
         obs = self.get_actor_obs(obs)
         obs = self.actor_obs_normalizer(obs)
         obs = self.obs_project_actor(obs)
-        features = self._apply_transformer(
+        features,self._actor_inference_state = self._apply_transformer(
             obs,
-            "_actor_inference_state",
+            self._actor_inference_state,
         )
         # if masks is not None:
         #     features = unpad_trajectories(features, masks)
@@ -253,16 +278,22 @@ class ActorCriticTransformerXL(nn.Module):
         else:
             return self.actor(features)
 
-    def evaluate(self, obs, masks=None, hidden_states=None):
+    def evaluate(self, obs, masks=None, hidden_states=_default):
         obs = self.get_critic_obs(obs)
         obs = self.critic_obs_normalizer(obs)
         obs = self.obs_project_critic(obs)
-        features = self._apply_transformer(
+        features,state = self._apply_transformer(
             obs,
-            "_critic_state",
+            self._critic_state if hidden_states is _default else self.hidden_critic_state,
         )
-        # if masks is not None:
-        #     features = unpad_trajectories(features, masks)
+        if masks == "compute_returns":
+            # print("pass")
+            pass
+        elif hidden_states is _default:
+            self._critic_state = state
+        else:
+            self.hidden_critic_state = state
+
         return self.critic(features)
 
     def get_actor_obs(self, obs):
@@ -283,6 +314,10 @@ class ActorCriticTransformerXL(nn.Module):
     def get_hidden_states(self):
         return None, None
 
+    def get_transformerxl_state(self):
+        return self.hidden_actor_state, self.hidden_critic_state
+
+
     def detach_hidden_states(self, dones=None):
         return None, None
 
@@ -297,3 +332,9 @@ class ActorCriticTransformerXL(nn.Module):
     def load_state_dict(self, state_dict, strict=True):
         super().load_state_dict(state_dict, strict=strict)
         return True
+    def print_state(self, state):
+        cache = state
+        if cache and cache[0] is not None:
+            k, v = cache[0]
+            print(f"Key shape: {k.shape}")
+            print("="*20)

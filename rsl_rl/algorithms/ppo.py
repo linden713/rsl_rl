@@ -8,6 +8,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.optim.lr_scheduler import StepLR
 from itertools import chain
 
 from rsl_rl.modules import ActorCritic,ActorCriticRecurrent
@@ -65,7 +66,7 @@ class PPO:
             self.rnd = RandomNetworkDistillation(device=self.device, **rnd_cfg)
             # Create RND optimizer
             params = self.rnd.predictor.parameters()
-            self.rnd_optimizer = optim.Adam(params, lr=rnd_lr)
+            self.rnd_optimizer = optim.AdamW(params, lr=rnd_lr)
         else:
             self.rnd = None
             self.rnd_optimizer = None
@@ -98,7 +99,9 @@ class PPO:
         self.policy = policy
         self.policy.to(self.device)
         # Create optimizer
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+        self.optimizer = optim.AdamW(self.policy.parameters(), lr=learning_rate)
+        # Minimal scheduler: StepLR
+        self.scheduler = StepLR(self.optimizer, step_size=100, gamma=0.97)
         # Create rollout storage
         self.storage: RolloutStorage = None  # type: ignore
         self.transition = RolloutStorage.Transition()
@@ -132,6 +135,8 @@ class PPO:
     def act(self, obs):
         if self.policy.is_recurrent:
             self.transition.hidden_states = self.policy.get_hidden_states()
+        if self.policy.is_transformerxl:
+            self.transition.transformerxl_state = self.policy.get_transformerxl_state()
         # compute the actions and values
         self.transition.actions = self.policy.act(obs).detach()
         self.transition.values = self.policy.evaluate(obs).detach()
@@ -173,7 +178,7 @@ class PPO:
 
     def compute_returns(self, obs):
         # compute value for the last step
-        last_values = self.policy.evaluate(obs).detach()
+        last_values = self.policy.evaluate(obs,masks="compute_returns").detach()
         self.storage.compute_returns(
             last_values, self.gamma, self.lam, normalize_advantage=not self.normalize_advantage_per_mini_batch
         )
@@ -182,6 +187,16 @@ class PPO:
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
+        # Debug accumulators
+        dbg_adv_abs_mean = 0.0
+        dbg_adv_std = 0.0
+        dbg_ratio_mean = 0.0
+        dbg_ratio_std = 0.0
+        dbg_ratio_clip_frac = 0.0
+        dbg_kl_mean = 0.0
+        dbg_value_abs_mean = 0.0
+        dbg_returns_abs_mean = 0.0
+        # TXL start pos debug removed (abs pos no longer tracked)
         # -- RND loss
         if self.rnd:
             mean_rnd_loss = 0
@@ -193,11 +208,11 @@ class PPO:
         else:
             mean_symmetry_loss = None
 
+        update_steps = 0
         # generator for mini batches
         if self.policy.is_transformerxl:
             generator = self.storage.transformerxl_batch_generator()
         elif self.policy.is_recurrent:
-        # if self.policy.is_recurrent:
             generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         else:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
@@ -262,6 +277,11 @@ class PPO:
             sigma_batch = self.policy.action_std[:original_batch_size]
             entropy_batch = self.policy.entropy[:original_batch_size]
 
+            # Debug: advantages stats
+            with torch.no_grad():
+                dbg_adv_abs_mean += advantages_batch.abs().mean().item()
+                dbg_adv_std += advantages_batch.std().item()
+
             # KL
             if self.desired_kl is not None and self.schedule == "adaptive":
                 with torch.inference_mode():
@@ -299,6 +319,17 @@ class PPO:
                     for param_group in self.optimizer.param_groups:
                         param_group["lr"] = self.learning_rate
 
+            # KL for logging (compute regardless of schedule)
+            with torch.inference_mode():
+                kl_dbg = torch.sum(
+                    torch.log((sigma_batch + 1.0e-8) / (old_sigma_batch[:original_batch_size] + 1.0e-8))
+                    + (torch.square(old_sigma_batch[:original_batch_size]) + torch.square(old_mu_batch[:original_batch_size] - mu_batch))
+                    / (2.0 * torch.square(sigma_batch) + 1.0e-8)
+                    - 0.5,
+                    axis=-1,
+                )
+                dbg_kl_mean += torch.mean(kl_dbg).item()
+
             # Surrogate loss
             ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
             surrogate = -torch.squeeze(advantages_batch) * ratio
@@ -306,6 +337,13 @@ class PPO:
                 ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
             )
             surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+
+            # Debug: ratio stats and clipping fraction
+            with torch.no_grad():
+                dbg_ratio_mean += ratio.mean().item()
+                dbg_ratio_std += ratio.std().item()
+                clipped = (ratio < (1.0 - self.clip_param)) | (ratio > (1.0 + self.clip_param))
+                dbg_ratio_clip_frac += clipped.float().mean().item()
 
             # Value function loss
             if self.use_clipped_value_loss:
@@ -317,6 +355,11 @@ class PPO:
                 value_loss = torch.max(value_losses, value_losses_clipped).mean()
             else:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
+
+            # Debug: value/returns magnitude
+            with torch.no_grad():
+                dbg_value_abs_mean += value_batch.abs().mean().item()
+                dbg_returns_abs_mean += returns_batch.abs().mean().item()
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
@@ -399,9 +442,10 @@ class PPO:
             # -- Symmetry loss
             if mean_symmetry_loss is not None:
                 mean_symmetry_loss += symmetry_loss.item()
+            update_steps += 1
 
         # -- For PPO
-        num_updates = self.num_learning_epochs * self.num_mini_batches
+        num_updates = max(update_steps, 1)
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
@@ -414,12 +458,33 @@ class PPO:
         # -- Clear the storage
         self.storage.clear()
 
+        # Step the scheduler once per update and sync recorded LR
+        if self.scheduler is not None:
+            self.scheduler.step()
+            self.learning_rate = self.optimizer.param_groups[0]["lr"]
+
+        
+
         # construct the loss dictionary
         loss_dict = {
             "value_function": mean_value_loss,
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
         }
+        if update_steps > 0:
+            loss_dict.update(
+                {
+                    "debug/adv_abs_mean": dbg_adv_abs_mean / update_steps,
+                    "debug/adv_std": dbg_adv_std / update_steps,
+                    "debug/ratio_mean": dbg_ratio_mean / update_steps,
+                    "debug/ratio_std": dbg_ratio_std / update_steps,
+                    "debug/ratio_clip_frac": dbg_ratio_clip_frac / update_steps,
+                    "debug/kl": dbg_kl_mean / update_steps,
+                    "debug/value_abs_mean": dbg_value_abs_mean / update_steps,
+                    "debug/returns_abs_mean": dbg_returns_abs_mean / update_steps,
+                }
+            )
+            # No abs position logging for Transformer-XL state
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
