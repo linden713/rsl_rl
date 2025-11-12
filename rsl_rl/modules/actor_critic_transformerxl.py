@@ -156,14 +156,14 @@ class ActorCriticTransformerXL(nn.Module):
         return self.distribution.entropy().sum(dim=-1)
 
     def reset(self, dones=None, hidden_states=None):
+        pass
+        # dones_bool = dones.to(dtype=torch.bool)
 
-        dones_bool = dones.to(dtype=torch.bool)
-
-        self._actor_state = self._mask_done_entries(self._actor_state, dones_bool)
-        self._actor_inference_state = self._mask_done_entries(self._actor_inference_state, dones_bool)
-        self._critic_state = self._mask_done_entries(self._critic_state, dones_bool)
-        self.hidden_actor_state = self._mask_done_entries(self.hidden_actor_state, dones_bool)
-        self.hidden_critic_state = self._mask_done_entries(self.hidden_critic_state, dones_bool)
+        # self._actor_state = self._mask_done_entries(self._actor_state, dones_bool)
+        # self._actor_inference_state = self._mask_done_entries(self._actor_inference_state, dones_bool)
+        # self._critic_state = self._mask_done_entries(self._critic_state, dones_bool)
+        # self.hidden_actor_state = self._mask_done_entries(self.hidden_actor_state, dones_bool)
+        # self.hidden_critic_state = self._mask_done_entries(self.hidden_critic_state, dones_bool)
 
 
     def forward(self):
@@ -258,8 +258,6 @@ class ActorCriticTransformerXL(nn.Module):
         else:
             self.hidden_actor_state = state
 
-        # if masks is not None:
-        #     features = unpad_trajectories(features, masks)
         self._update_distribution(features)
         return self.distribution.sample()
 
@@ -271,8 +269,7 @@ class ActorCriticTransformerXL(nn.Module):
             obs,
             self._actor_inference_state,
         )
-        # if masks is not None:
-        #     features = unpad_trajectories(features, masks)
+
         if self.state_dependent_std:
             return self.actor(features)[..., 0, :]
         else:
@@ -287,7 +284,6 @@ class ActorCriticTransformerXL(nn.Module):
             self._critic_state if hidden_states is _default else self.hidden_critic_state,
         )
         if masks == "compute_returns":
-            # print("pass")
             pass
         elif hidden_states is _default:
             self._critic_state = state

@@ -41,9 +41,16 @@ class VecEnv(ABC):
     cfg: dict | object
     """Configuration object."""
 
+    current_iteration: int = 0
+    """Current training iteration."""
+
     """
     Operations.
     """
+
+    def set_iteration(self, iteration: int):
+        """Set the current training iteration."""
+        self.current_iteration = iteration
 
     @abstractmethod
     def get_observations(self) -> TensorDict:
