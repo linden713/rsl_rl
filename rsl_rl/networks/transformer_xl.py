@@ -10,35 +10,35 @@ from typing import List, Optional, Tuple
 
 
 def precompute_freqs_cis(dim: int, seq_len: int, theta: float = 10000.0):
-    # 计算词向量元素两两分组之后，每组元素对应的旋转角度\theta_i
+    # Compute the rotation angle theta_i for every pair of embedding dimensions.
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    # 生成 token 序列索引 t = [0, 1,..., seq_len-1]
+    # Generate token indices t = [0, 1, ..., seq_len - 1].
     t = torch.arange(seq_len, device=freqs.device)
     # freqs.shape = [seq_len, dim // 2]
-    freqs = torch.outer(t, freqs).float()  # 计算m * \theta
+    freqs = torch.outer(t, freqs).float()  # Compute m * theta.
 
-    # 计算结果是个复数向量
-    # 假设 freqs = [x, y]
-    # 则 freqs_cis = [cos(x) + sin(x)i, cos(y) + sin(y)i]
+    # The result represents complex vectors.
+    # For example, when freqs = [x, y],
+    # freqs_cis becomes [cos(x) + sin(x)i, cos(y) + sin(y)i].
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
     return freqs_cis
 
 
-# 旋转位置编码计算
+# Rotary positional encoding helper
 def apply_rotary_emb(
     xq: torch.Tensor,
     xk: torch.Tensor,
     freqs_cis: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    应用RoPE位置编码。
-    输入形状: [batch, seq, dim] 或 [batch*heads, seq, dim]
+    Apply RoPE positional encoding.
+    Input shape: [batch, seq, dim] or [batch * heads, seq, dim].
     """
-    # 转为复数域并应用旋转变换
+    # Convert to complex domain and apply the rotation.
     xq_cis = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2)) * freqs_cis
     xk_cis = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2)) * freqs_cis
 
-    # 转回实数域并恢复原始形状
+    # Convert back to the real domain and restore the original shape.
     xq_out = torch.view_as_real(xq_cis).flatten(-2).type_as(xq)
     xk_out = torch.view_as_real(xk_cis).flatten(-2).type_as(xk)
     return xq_out, xk_out
@@ -54,7 +54,7 @@ def init_weights(module, depth=None):
         nn.init.xavier_uniform_(module.weight)
         if module.bias is not None:
             nn.init.zeros_(module.bias)
-        # 残差缩放
+        # Residual scaling.
         if depth is not None and module.out_features == module.in_features:
             with torch.no_grad():
                 module.weight.mul_(1.0 / (depth**0.5))
@@ -79,14 +79,14 @@ class RMSNorm(nn.Module):
 
 
 class SwiGLUFeedForward(nn.Module):
-    """SwiGLU前馈网络，不包含内部dropout（由外层的resid_dropout统一处理）。"""
+    """SwiGLU feed-forward network; dropout is handled externally via resid_dropout."""
 
     def __init__(self, dim: int, hidden_dim: int, dropout: float) -> None:
         super().__init__()
         self.value = nn.Linear(dim, hidden_dim)
         self.gate = nn.Linear(dim, hidden_dim)
         self.proj = nn.Linear(hidden_dim, dim)
-        # Note: dropout参数保留用于接口兼容性，但不使用
+        # Note: dropout parameter remains for API compatibility but is unused.
 
     def forward(self, x: Tensor) -> Tensor:
         gated = F.silu(self.gate(x))
@@ -137,8 +137,8 @@ class TransformerXLEncoderLayer(nn.Module):
         self.resid_dropout = nn.Dropout(dropout)
 
         self.ffn = SwiGLUFeedForward(dim, ff_dim, dropout)
-        # 最大相对位置偏置幅度（控制整个可见范围内的最大logit偏置跨度）。
-        # 设为0可关闭该偏置；默认约2.0，量级与缩放后的QK logits相当。
+        # Maximum magnitude for the relative positional bias (keeps logits within a controlled range).
+        # Set to 0 to disable; default ~2.0 keeps it on the same scale as the scaled QK logits.
         self.pos_bias_max = float(pos_bias_max)
 
     def _shape(self, x: Tensor) -> Tensor:
@@ -181,7 +181,7 @@ class TransformerXLEncoderLayer(nn.Module):
 
     @staticmethod
     def _causal_mask(seq_len: int, prev_len: int, total_len: int, device: torch.device) -> Tensor | None:
-        """创建因果注意力mask。左半部分（缓存）全可见，右半部分（当前序列）应用因果mask。"""
+        """Create a causal mask: cached tokens are fully visible, current tokens use causal masking."""
         if seq_len <= 1 or prev_len < 0:
             return None
 
@@ -202,15 +202,15 @@ class TransformerXLEncoderLayer(nn.Module):
         cache: tuple[Tensor, Tensor] | None,
         cache_limit: int,
     ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
-        """应用带RoPE和缓存的注意力机制."""
+        """Apply RoPE attention with caching."""
         batch_size, seq_len, _ = x.shape
 
-        # 生成Q, K, V (raw)
+        # Generate raw Q, K, V tensors.
         q_raw = self._shape(self.q_proj(x))  # [B, H, T, D_h]
         k_raw = self._shape(self.k_proj(x))
         v_raw = self._shape(self.v_proj(x))
 
-        # 合并缓存（保持为未旋转的原始K/V）
+        # Merge the cache while keeping raw, unrotated K/V.
         if cache_limit != 0:
             k_attn_raw, v_attn_raw, k_cache_raw, v_cache_raw = self._merge_with_cache(k_raw, v_raw, cache, cache_limit)
         else:
@@ -219,23 +219,23 @@ class TransformerXLEncoderLayer(nn.Module):
         total_len = k_attn_raw.shape[2]
         prev_len = total_len - seq_len
 
-        # 计算Q的RoPE（位置区间：[prev_len, prev_len + seq_len)）
+        # Apply RoPE to Q over positions [prev_len, prev_len + seq_len).
         q_freqs = self._get_freqs(prev_len, seq_len)
         q = apply_rotary_single(q_raw.flatten(0, 1), q_freqs)
         q = q.view(batch_size, self.heads, seq_len, self.head_dim)
 
-        # 计算K的RoPE（合并后整体旋转，位置区间：[prev_len - prev_len, prev_len + seq_len) = [0, total_len)）
+        # Apply RoPE to merged K over positions [0, total_len).
         k_freqs = self._get_freqs(prev_len - prev_len, total_len)
         k = apply_rotary_single(k_attn_raw.flatten(0, 1), k_freqs)
         k = k.view(batch_size, self.heads, total_len, self.head_dim)
-        v_attn = v_attn_raw  # V 不进行旋转
+        v_attn = v_attn_raw  # V remains unrotated.
 
-        # 计算注意力mask与相对位置偏置
-        # 注：SDPA内部已做1/sqrt(d)缩放，典型QK对数值量级约O(1)。
-        # 因此这里将总跨度限制在pos_bias_max，使其与原始logits同量级。
+        # Compute attention bias with relative positions.
+        # SDPA already applies 1/sqrt(d) scaling, so QK logits are O(1).
+        # Keep the bias range within pos_bias_max to match that scale.
         if self.pos_bias_max > 0.0:
-            # 相对位置：对每个query i，bias ~ slope * (j - i_abs)，越接近i越大（更不负）。
-            # 这样在因果约束下自然形成“近期偏好”。
+            # Relative bias: for query i, bias ~ slope * (j - i_abs); closer positions get larger values.
+            # This naturally encourages recency under the causal mask.
             slope = self.pos_bias_max / max(total_len - 1, 1)
             j_idx = torch.arange(total_len, device=x.device).view(1, -1).float()  # [1, total_len]
             i_abs = (prev_len + torch.arange(seq_len, device=x.device).view(-1, 1)).float()  # [seq_len, 1]
@@ -243,7 +243,7 @@ class TransformerXLEncoderLayer(nn.Module):
         else:
             attn_mask = torch.zeros(seq_len, total_len, device=x.device)
 
-        # 叠加因果遮罩（未来位置置为 -inf）
+        # Apply the causal mask, setting future positions to -inf.
         causal = self._causal_mask(seq_len, prev_len, total_len, x.device)  # bool or None
         if causal is not None:
             attn_mask = attn_mask.masked_fill(causal, float("-inf"))
@@ -257,7 +257,7 @@ class TransformerXLEncoderLayer(nn.Module):
             is_causal=False,
         )
 
-        # 重塑输出: [B, H, T, D_h] -> [B, T, D]
+        # Reshape output: [B, H, T, D_h] -> [B, T, D]
         attn_output = attn_output.permute(0, 2, 1, 3).contiguous().flatten(2)
         return attn_output, (k_cache_raw, v_cache_raw)
 
@@ -267,7 +267,7 @@ class TransformerXLEncoderLayer(nn.Module):
         cache: tuple[Tensor, Tensor] | None,
         cache_limit: int,
     ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
-        """处理序列块（可带注意力缓存）。"""
+        """Process a chunk of tokens, optionally using the KV cache."""
         # Pre-norm attention with residual connection
         residual = x
         x = self.attn_norm(x)
