@@ -8,10 +8,10 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import StepLR
 from itertools import chain
+from torch.optim.lr_scheduler import StepLR
 
-from rsl_rl.modules import ActorCritic,ActorCriticRecurrent
+from rsl_rl.modules import ActorCritic, ActorCriticRecurrent
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import string_to_callable
@@ -84,7 +84,7 @@ class PPO:
             # Check valid configuration
             if not callable(symmetry_cfg["data_augmentation_func"]):
                 raise ValueError(
-                    f"Symmetry configuration exists but the function is not callable: "
+                    "Symmetry configuration exists but the function is not callable: "
                     f"{symmetry_cfg['data_augmentation_func']}"
                 )
             # Check if the policy is compatible with symmetry
@@ -135,8 +135,6 @@ class PPO:
     def act(self, obs):
         if self.policy.is_recurrent:
             self.transition.hidden_states = self.policy.get_hidden_states()
-        if self.policy.is_transformerxl:
-            self.transition.transformerxl_state = self.policy.get_transformerxl_state()
         # compute the actions and values
         self.transition.actions = self.policy.act(obs).detach()
         self.transition.values = self.policy.evaluate(obs).detach()
@@ -178,7 +176,7 @@ class PPO:
 
     def compute_returns(self, obs):
         # compute value for the last step
-        last_values = self.policy.evaluate(obs,masks="compute_returns").detach()
+        last_values = self.policy.evaluate(obs, masks="compute_returns").detach()
         self.storage.compute_returns(
             last_values, self.gamma, self.lam, normalize_advantage=not self.normalize_advantage_per_mini_batch
         )
@@ -208,7 +206,6 @@ class PPO:
         else:
             mean_symmetry_loss = None
 
-        update_steps = 0
         # generator for mini batches
         if self.policy.is_transformerxl:
             generator = self.storage.transformerxl_batch_generator()
@@ -218,7 +215,7 @@ class PPO:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
 
         # iterate over batches
-        for (
+        for update_steps, (
             obs_batch,
             actions_batch,
             target_values_batch,
@@ -229,7 +226,7 @@ class PPO:
             old_sigma_batch,
             hid_states_batch,
             masks_batch,
-        ) in generator:
+        ) in enumerate(generator):
 
             # number of augmentations per sample
             # we start with 1 and increase it if we use symmetry augmentation
@@ -323,7 +320,10 @@ class PPO:
             with torch.inference_mode():
                 kl_dbg = torch.sum(
                     torch.log((sigma_batch + 1.0e-8) / (old_sigma_batch[:original_batch_size] + 1.0e-8))
-                    + (torch.square(old_sigma_batch[:original_batch_size]) + torch.square(old_mu_batch[:original_batch_size] - mu_batch))
+                    + (
+                        torch.square(old_sigma_batch[:original_batch_size])
+                        + torch.square(old_mu_batch[:original_batch_size] - mu_batch)
+                    )
                     / (2.0 * torch.square(sigma_batch) + 1.0e-8)
                     - 0.5,
                     axis=-1,
@@ -442,7 +442,6 @@ class PPO:
             # -- Symmetry loss
             if mean_symmetry_loss is not None:
                 mean_symmetry_loss += symmetry_loss.item()
-            update_steps += 1
 
         # -- For PPO
         num_updates = max(update_steps, 1)
@@ -462,8 +461,6 @@ class PPO:
         if self.scheduler is not None:
             self.scheduler.step()
             self.learning_rate = self.optimizer.param_groups[0]["lr"]
-
-        
 
         # construct the loss dictionary
         loss_dict = {

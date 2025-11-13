@@ -1,11 +1,12 @@
+# SPDX-License-Identifier: BSD-3-Clause
+
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
-
 import torch
-from torch import Tensor
 import torch.nn as nn
 import torch.nn.functional as F
+from torch import Tensor
+from typing import List, Optional, Tuple
 
 
 def precompute_freqs_cis(dim: int, seq_len: int, theta: float = 10000.0):
@@ -13,21 +14,22 @@ def precompute_freqs_cis(dim: int, seq_len: int, theta: float = 10000.0):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     # 生成 token 序列索引 t = [0, 1,..., seq_len-1]
     t = torch.arange(seq_len, device=freqs.device)
-    # freqs.shape = [seq_len, dim // 2] 
+    # freqs.shape = [seq_len, dim // 2]
     freqs = torch.outer(t, freqs).float()  # 计算m * \theta
 
     # 计算结果是个复数向量
     # 假设 freqs = [x, y]
     # 则 freqs_cis = [cos(x) + sin(x)i, cos(y) + sin(y)i]
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs) 
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
     return freqs_cis
+
 
 # 旋转位置编码计算
 def apply_rotary_emb(
     xq: torch.Tensor,
     xk: torch.Tensor,
     freqs_cis: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     应用RoPE位置编码。
     输入形状: [batch, seq, dim] 或 [batch*heads, seq, dim]
@@ -35,15 +37,18 @@ def apply_rotary_emb(
     # 转为复数域并应用旋转变换
     xq_cis = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2)) * freqs_cis
     xk_cis = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2)) * freqs_cis
-    
+
     # 转回实数域并恢复原始形状
     xq_out = torch.view_as_real(xq_cis).flatten(-2).type_as(xq)
     xk_out = torch.view_as_real(xk_cis).flatten(-2).type_as(xk)
     return xq_out, xk_out
 
+
 def apply_rotary_single(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     x_cis = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2)) * freqs_cis
     return torch.view_as_real(x_cis).flatten(-2).type_as(x)
+
+
 def init_weights(module, depth=None):
     if isinstance(module, nn.Linear):
         nn.init.xavier_uniform_(module.weight)
@@ -52,13 +57,15 @@ def init_weights(module, depth=None):
         # 残差缩放
         if depth is not None and module.out_features == module.in_features:
             with torch.no_grad():
-                module.weight.mul_(1.0 / (depth ** 0.5))
+                module.weight.mul_(1.0 / (depth**0.5))
+
 
 def init_transformer(model, depth):
     nn.init.xavier_uniform_(model.input_proj.weight)
     nn.init.zeros_(model.input_proj.bias)
     for layer in model.layers:
         layer.apply(lambda m: init_weights(m, depth))
+
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6) -> None:
@@ -73,6 +80,7 @@ class RMSNorm(nn.Module):
 
 class SwiGLUFeedForward(nn.Module):
     """SwiGLU前馈网络，不包含内部dropout（由外层的resid_dropout统一处理）。"""
+
     def __init__(self, dim: int, hidden_dim: int, dropout: float) -> None:
         super().__init__()
         self.value = nn.Linear(dim, hidden_dim)
@@ -89,7 +97,18 @@ class SwiGLUFeedForward(nn.Module):
 class TransformerXLEncoderLayer(nn.Module):
     """Minimal encoder block with RoPE attention and SwiGLU FFN."""
 
-    def __init__(self, dim: int, heads: int, ff_dim: int, dropout: float, max_seq_len: int, rotary_base: float = 10000.0, *, pos_bias_max: float = 2.0, norm_type: str = "rms") -> None:
+    def __init__(
+        self,
+        dim: int,
+        heads: int,
+        ff_dim: int,
+        dropout: float,
+        max_seq_len: int,
+        rotary_base: float = 10000.0,
+        *,
+        pos_bias_max: float = 2.0,
+        norm_type: str = "rms",
+    ) -> None:
         super().__init__()
         if dim % heads != 0:
             raise ValueError("embedding dimension must be divisible by number of heads.")
@@ -139,9 +158,9 @@ class TransformerXLEncoderLayer(nn.Module):
         self,
         new_k: Tensor,
         new_v: Tensor,
-        cache: Optional[Tuple[Tensor, Tensor]],
+        cache: tuple[Tensor, Tensor] | None,
         cache_limit: int,
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         # Cache and return RAW (unrotated) K/V tensors
         if cache is None:
             k_attn_raw, v_attn_raw = new_k, new_v  # [batch, heads, seq, head_dim]
@@ -149,9 +168,7 @@ class TransformerXLEncoderLayer(nn.Module):
             k_cached, v_cached = cache
             batch_size = new_k.size(0)
             if k_cached.size(0) != batch_size:
-                raise ValueError(
-                    f"Cache batch dimension {k_cached.size(0)} does not match new batch {batch_size}"
-                )
+                raise ValueError(f"Cache batch dimension {k_cached.size(0)} does not match new batch {batch_size}")
             k_attn_raw = torch.cat([k_cached, new_k], dim=2)  # [batch, heads, prev + seq, head_dim]
             v_attn_raw = torch.cat([v_cached, new_v], dim=2)  # [batch, heads, prev + seq, head_dim]
 
@@ -163,13 +180,13 @@ class TransformerXLEncoderLayer(nn.Module):
         return k_attn_raw, v_attn_raw, k_attn_raw.detach(), v_attn_raw.detach()
 
     @staticmethod
-    def _causal_mask(seq_len: int, prev_len: int, total_len: int, device: torch.device) -> Optional[Tensor]:
+    def _causal_mask(seq_len: int, prev_len: int, total_len: int, device: torch.device) -> Tensor | None:
         """创建因果注意力mask。左半部分（缓存）全可见，右半部分（当前序列）应用因果mask。"""
         if seq_len <= 1 or prev_len < 0:
             return None
-    
+
         mask = torch.zeros(seq_len, total_len, device=device, dtype=torch.bool)
-        
+
         if seq_len > 1 and prev_len < total_len:
             future_cols = total_len - prev_len
             mask[:, prev_len:total_len] = torch.triu(
@@ -182,12 +199,12 @@ class TransformerXLEncoderLayer(nn.Module):
     def _apply_attention(
         self,
         x: Tensor,
-        cache: Optional[Tuple[Tensor, Tensor]],
+        cache: tuple[Tensor, Tensor] | None,
         cache_limit: int,
-    ) -> Tuple[Tensor, Tuple[Tensor, Tensor]]:
+    ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
         """应用带RoPE和缓存的注意力机制."""
         batch_size, seq_len, _ = x.shape
-        
+
         # 生成Q, K, V (raw)
         q_raw = self._shape(self.q_proj(x))  # [B, H, T, D_h]
         k_raw = self._shape(self.k_proj(x))
@@ -212,7 +229,7 @@ class TransformerXLEncoderLayer(nn.Module):
         k = apply_rotary_single(k_attn_raw.flatten(0, 1), k_freqs)
         k = k.view(batch_size, self.heads, total_len, self.head_dim)
         v_attn = v_attn_raw  # V 不进行旋转
-        
+
         # 计算注意力mask与相对位置偏置
         # 注：SDPA内部已做1/sqrt(d)缩放，典型QK对数值量级约O(1)。
         # 因此这里将总跨度限制在pos_bias_max，使其与原始logits同量级。
@@ -227,17 +244,19 @@ class TransformerXLEncoderLayer(nn.Module):
             attn_mask = torch.zeros(seq_len, total_len, device=x.device)
 
         # 叠加因果遮罩（未来位置置为 -inf）
-        causal = self._causal_mask(seq_len, prev_len, total_len, x.device)              # bool or None
+        causal = self._causal_mask(seq_len, prev_len, total_len, x.device)  # bool or None
         if causal is not None:
-            attn_mask = attn_mask.masked_fill(causal, float("-inf"))   
+            attn_mask = attn_mask.masked_fill(causal, float("-inf"))
 
         attn_output = F.scaled_dot_product_attention(
-            q, k, v_attn,
+            q,
+            k,
+            v_attn,
             attn_mask=attn_mask,
             dropout_p=self.attn_dropout.p if self.training else 0.0,
             is_causal=False,
         )
-        
+
         # 重塑输出: [B, H, T, D_h] -> [B, T, D]
         attn_output = attn_output.permute(0, 2, 1, 3).contiguous().flatten(2)
         return attn_output, (k_cache_raw, v_cache_raw)
@@ -245,21 +264,21 @@ class TransformerXLEncoderLayer(nn.Module):
     def forward(
         self,
         x: Tensor,
-        cache: Optional[Tuple[Tensor, Tensor]],
+        cache: tuple[Tensor, Tensor] | None,
         cache_limit: int,
-    ) -> Tuple[Tensor, Tuple[Tensor, Tensor]]:
+    ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
         """处理序列块（可带注意力缓存）。"""
         # Pre-norm attention with residual connection
         residual = x
         x = self.attn_norm(x)
         attn_output, new_cache = self._apply_attention(x, cache, cache_limit)
         x = residual + self.resid_dropout(self.out_proj(attn_output))
-        
+
         # Pre-norm FFN with residual connection
         residual = x
         x = self.ffn_norm(x)
         x = residual + self.resid_dropout(self.ffn(x))
-        
+
         return x, new_cache
 
 
@@ -313,24 +332,23 @@ class TransformerXL(nn.Module):
             self.final_norm = RMSNorm(model_dim)
         init_transformer(self, depth)
 
-
     def init_state(self) -> TransformerXLState:
         """Create an empty cache state (per-layer raw KV)."""
         return [None] * len(self.layers)
 
-    def _normalize_state(self, state: Optional[TransformerXLState]) -> TransformerXLState:
+    def _normalize_state(self, state: TransformerXLState | None) -> TransformerXLState:
         if state is None:
             return self.init_state()
         cache_list = state
         if cache_list is None or len(cache_list) != len(self.layers):
-            raise ValueError("cache_list is none ot cache_list length is not equal to layers length")
+            raise ValueError("cache_list is none or cache_list length is not equal to layers length")
         return cache_list
 
     def forward(
         self,
         x: Tensor,  # Assumes input is [batch, seq, dim]
-        state: Optional[TransformerXLState] = None,
-    ) -> Tuple[Tensor, TransformerXLState]:
+        state: TransformerXLState | None = None,
+    ) -> tuple[Tensor, TransformerXLState]:
         """
         Processes a sequence of observations.
         Assumes input x is already in [batch, seq, dim] format.
@@ -346,7 +364,7 @@ class TransformerXL(nn.Module):
         # Normalize state and process layers
         cache_list = self._normalize_state(state)
         hidden = embeddings
-        next_cache: List[Tuple[Tensor, Tensor]] = []
+        next_cache: list[tuple[Tensor, Tensor]] = []
 
         for layer, layer_cache in zip(self.layers, cache_list):
             hidden, new_cache = layer(hidden, layer_cache, self.memory_length)

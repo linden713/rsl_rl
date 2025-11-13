@@ -9,12 +9,13 @@ import torch
 import torch.nn as nn
 from torch.distributions import Normal
 
-from rsl_rl.networks import EmpiricalNormalization, MLP, TransformerXL
-from rsl_rl.utils import unpad_trajectories
+from rsl_rl.networks import MLP, EmpiricalNormalization, TransformerXL
 
 _default = object()
+
+
 class ActorCriticTransformerXL(nn.Module):
-    is_recurrent = False 
+    is_recurrent = False
     is_transformerxl = True
 
     def __init__(
@@ -65,12 +66,8 @@ class ActorCriticTransformerXL(nn.Module):
         # transformer backbones (separate caches for actor and critic)
         # Project raw observations to transformer model dimension using a
         # single hidden layer (2x model dim).
-        self.obs_project_actor = MLP(
-            num_actor_obs, transformer_model_dim, [transformer_model_dim * 2], activation
-        )
-        self.obs_project_critic = MLP(
-            num_critic_obs, transformer_model_dim, [transformer_model_dim * 2], activation
-        )
+        self.obs_project_actor = MLP(num_actor_obs, transformer_model_dim, [transformer_model_dim * 2], activation)
+        self.obs_project_critic = MLP(num_critic_obs, transformer_model_dim, [transformer_model_dim * 2], activation)
 
         self.transformerxl = TransformerXL(
             transformer_model_dim,
@@ -83,7 +80,6 @@ class ActorCriticTransformerXL(nn.Module):
             pos_bias_max=transformer_pos_bias_max,
             norm_type=transformer_norm_type,
         )
-
 
         # actor
         if self.state_dependent_std:
@@ -119,29 +115,24 @@ class ActorCriticTransformerXL(nn.Module):
                     self.actor[-2].bias[num_actions:], torch.log(torch.tensor(init_noise_std + 1e-7))
                 )
             else:
-                raise ValueError(
-                    f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'"
-                )
+                raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
         else:
             if self.noise_std_type == "scalar":
                 self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
             elif self.noise_std_type == "log":
                 self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
             else:
-                raise ValueError(
-                    f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'"
-                )
+                raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
 
         self.distribution = None
         Normal.set_default_validate_args(False)
 
-        self._actor_state = None
-        self._actor_inference_state = None
-        self._critic_state = None
+        self.rollout_actor_cache = None
+        self.inference_actor_cache = None
+        self.rollout_critic_cache = None
 
-        self.hidden_actor_state = None
-        self.hidden_critic_state = None
-
+        self.training_actor_cache = None
+        self.training_critic_cache = None
 
     @property
     def action_mean(self):
@@ -159,16 +150,15 @@ class ActorCriticTransformerXL(nn.Module):
         pass
         # dones_bool = dones.to(dtype=torch.bool)
 
-        # self._actor_state = self._mask_done_entries(self._actor_state, dones_bool)
-        # self._actor_inference_state = self._mask_done_entries(self._actor_inference_state, dones_bool)
-        # self._critic_state = self._mask_done_entries(self._critic_state, dones_bool)
-        # self.hidden_actor_state = self._mask_done_entries(self.hidden_actor_state, dones_bool)
-        # self.hidden_critic_state = self._mask_done_entries(self.hidden_critic_state, dones_bool)
-
+        # self.rollout_actor_cache = self._mask_done_entries(self.rollout_actor_cache, dones_bool)
+        # self.inference_actor_cache = self._mask_done_entries(self.inference_actor_cache, dones_bool)
+        # self.rollout_critic_cache = self._mask_done_entries(self.rollout_critic_cache, dones_bool)
+        # self.training_actor_cache = self._mask_done_entries(self.training_actor_cache, dones_bool)
+        # self.training_critic_cache = self._mask_done_entries(self.training_critic_cache, dones_bool)
 
     def forward(self):
         raise NotImplementedError
-    
+
     def _mask_done_entries(self, state, dones):
         if state is None or dones is None:
             return state
@@ -189,7 +179,6 @@ class ActorCriticTransformerXL(nn.Module):
                 masked_v = v * keep_mask if v is not None else None
                 masked_cache.append((masked_k, masked_v))
         return masked_cache
-
 
     def _apply_transformer(self, obs, state):
         """Run the Transformer-XL backbone while keeping tensor layouts explicit.
@@ -230,9 +219,7 @@ class ActorCriticTransformerXL(nn.Module):
                 mean, log_std = torch.unbind(mean_and_std, dim=-2)
                 std = torch.exp(log_std)
             else:
-                raise ValueError(
-                    f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'"
-                )
+                raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
         else:
             mean = self.actor(features)
             if self.noise_std_type == "scalar":
@@ -240,23 +227,21 @@ class ActorCriticTransformerXL(nn.Module):
             elif self.noise_std_type == "log":
                 std = torch.exp(self.log_std).expand_as(mean)
             else:
-                raise ValueError(
-                    f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'"
-                )
+                raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
         self.distribution = Normal(mean, std)
 
     def act(self, obs, masks=None, hidden_states=_default):
         obs = self.get_actor_obs(obs)
         obs = self.actor_obs_normalizer(obs)
         obs = self.obs_project_actor(obs)
-        features,state = self._apply_transformer(
+        features, state = self._apply_transformer(
             obs,
-            self._actor_state if hidden_states is _default else self.hidden_actor_state ,
+            self.rollout_actor_cache if hidden_states is _default else self.training_actor_cache,
         )
         if hidden_states is _default:
-            self._actor_state = state
+            self.rollout_actor_cache = state
         else:
-            self.hidden_actor_state = state
+            self.training_actor_cache = state
 
         self._update_distribution(features)
         return self.distribution.sample()
@@ -265,9 +250,9 @@ class ActorCriticTransformerXL(nn.Module):
         obs = self.get_actor_obs(obs)
         obs = self.actor_obs_normalizer(obs)
         obs = self.obs_project_actor(obs)
-        features,self._actor_inference_state = self._apply_transformer(
+        features, self.inference_actor_cache = self._apply_transformer(
             obs,
-            self._actor_inference_state,
+            self.inference_actor_cache,
         )
 
         if self.state_dependent_std:
@@ -279,16 +264,16 @@ class ActorCriticTransformerXL(nn.Module):
         obs = self.get_critic_obs(obs)
         obs = self.critic_obs_normalizer(obs)
         obs = self.obs_project_critic(obs)
-        features,state = self._apply_transformer(
+        features, state = self._apply_transformer(
             obs,
-            self._critic_state if hidden_states is _default else self.hidden_critic_state,
+            self.rollout_critic_cache if hidden_states is _default else self.training_critic_cache,
         )
         if masks == "compute_returns":
             pass
         elif hidden_states is _default:
-            self._critic_state = state
+            self.rollout_critic_cache = state
         else:
-            self.hidden_critic_state = state
+            self.training_critic_cache = state
 
         return self.critic(features)
 
@@ -311,8 +296,7 @@ class ActorCriticTransformerXL(nn.Module):
         return None, None
 
     def get_transformerxl_state(self):
-        return self.hidden_actor_state, self.hidden_critic_state
-
+        return self.training_actor_cache, self.training_critic_cache
 
     def detach_hidden_states(self, dones=None):
         return None, None
@@ -328,9 +312,10 @@ class ActorCriticTransformerXL(nn.Module):
     def load_state_dict(self, state_dict, strict=True):
         super().load_state_dict(state_dict, strict=strict)
         return True
+
     def print_state(self, state):
         cache = state
         if cache and cache[0] is not None:
             k, v = cache[0]
             print(f"Key shape: {k.shape}")
-            print("="*20)
+            print("=" * 20)

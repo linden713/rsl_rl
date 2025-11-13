@@ -24,7 +24,6 @@ class RolloutStorage:
             self.action_mean = None
             self.action_sigma = None
             self.hidden_states = None
-            self.transformerxl_state = None
 
         def clear(self):
             self.__init__()
@@ -71,8 +70,6 @@ class RolloutStorage:
         # For RNN networks
         self.saved_hidden_states_a = None
         self.saved_hidden_states_c = None
-        # For Transformer-XL networks
-        self.transformerxl_state = None
 
         # counter for the number of transitions stored
         self.step = 0
@@ -101,8 +98,6 @@ class RolloutStorage:
 
         # For RNN networks
         self._save_hidden_states(transition.hidden_states)
-        # For Transformer-XL networks
-        self._save_transformerxl_state(transition.transformerxl_state)
 
         # increment the counter
         self.step += 1
@@ -125,31 +120,6 @@ class RolloutStorage:
         for i in range(len(hid_a)):
             self.saved_hidden_states_a[i][self.step].copy_(hid_a[i])
             self.saved_hidden_states_c[i][self.step].copy_(hid_c[i])
-
-    def _clone_transformerxl_state(self, state):
-        if state is None:
-            return None
-        # Backward compatibility: if a tuple is passed, take the cache part
-        cache = state[0] if isinstance(state, tuple) else state
-        if cache is None:
-            return None
-        cloned_cache = []
-        for layer_cache in cache:
-            if layer_cache is None:
-                cloned_cache.append(None)
-                continue
-            k, v = layer_cache
-            cloned_cache.append((k.detach().clone(), v.detach().clone()))
-        return cloned_cache
-
-    def _save_transformerxl_state(self, transformer_state):
-        if transformer_state is None or self.transformerxl_state is not None:
-            return
-        actor_state, critic_state = transformer_state
-        self.transformerxl_state = (
-            self._clone_transformerxl_state(actor_state),
-            self._clone_transformerxl_state(critic_state),
-        )
 
     def clear(self):
         self.step = 0
@@ -289,8 +259,6 @@ class RolloutStorage:
 
                 first_traj = last_traj
 
-
-
     def transformerxl_batch_generator(self):
         if self.training_type != "rl":
             raise ValueError("This function is only available for reinforcement learning training.")
@@ -309,7 +277,6 @@ class RolloutStorage:
         advantages_batch = self.advantages
         values_batch = self.values
         old_actions_log_prob_batch = self.actions_log_prob
-        transformer_state = self.transformerxl_state if self.transformerxl_state is not None else (None, None)
 
         yield (
             obs_batch,
@@ -320,6 +287,6 @@ class RolloutStorage:
             old_actions_log_prob_batch,
             old_mu_batch,
             old_sigma_batch,
-            transformer_state,
+            (None, None),
             None,
         )
